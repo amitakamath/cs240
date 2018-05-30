@@ -1,0 +1,58 @@
+Phase 5 - Data Races
+
+Part 1  - Eliminating Data Races
+Up until phase 4, due to the presence of only one kernel thread, all our threads  were
+cooperative. However, with phase_extra_credit, multiple kernels threads made the library preemptive.
+After implementing garbage collection, our library was segfaulting for the phase_extra_credit due to
+the presence of data races. According to our analysis this was happening if a kernel thread prempted
+another kernel thread while it was in the process of doing a context switch between its user
+threads, where one of the threads involved in the switch was a zombie thread. Following is the sequence
+of events without any locks in our library:
+
+1. Kernel thread t1 running.
+2. User thread T1 and T2 undergo context switch on T1->context and T2->context where T1 is a zombie 
+thread and is on the thread queue. 
+3. Kernel thread t2 preempts t1 and calls garbage collect thus removing T1 from the queue and freeing
+the memory allocated to it. 
+4. t1 starts running again, accesses memory for T1 which has been deallocated -> segfault.
+
+We fixed this problem by protecting all accesses of our global thread queue with locks. However, we still
+faced the following issues:
+
+1. If we protect our context switch with the mutex lock, everything would deadlock as after the context switch,
+the new thread comes to Thread Entry and calls Yield, which would deadlock because the lock is held by the old thread.
+2. If we release the queue lock before context switch, we run into the same segfault issue related to the
+garbage collection mentioned above.
+
+
+We came up with the following solution:
+
+We include context switch in our critical section and release the lock after context switch. However, to
+solve the deadlock issue, we release the queue lock at the begining of Thread_Entry() which is where the thread 
+lands after a context switch. This solves both our problems and we are able to context switch between the
+user threads atomically while running on the same kernel thread; we then release the lock so that any
+other kernel thread can preempt us after we have successfully completed our context switch.
+
+We did not protect the "next_id" variable, although it is global, because it is atomic and thus cannot be pre-empted while accessing.
+
+With this all our phases ran without any errors and warnings which made us feel confident about the robustness
+of our library. We ran Valgrind on our code as well, which returned the expected output: 0 errors/warnings, and exactly one thread of allocated memory at the end of execution (the initial thread). The rest of the memory was successfully freed.
+
+
+Part 2 - Creating Data Race: DCLP
+We wrote a program with DCLP in data_race.cpp. Here we are spawning 3 kernel threads, which each spawn a user 
+thread using our library: these threads each checks (without acquiring a lock) if a global file pointer pFile has been set. If it is null then we acquire a lock and check if it is null again which is similar to the DCLP problem described in the Eraser paper.
+
+If no other thread has set pFile yet, we set it and unlock the mutex, else we just return from the function. This is a data
+race according to the threadsanitizer since pFile is a global variable and we are doing a check for  if(pFile == NULL) without acquiring any locks. However, in reality, we never set it without acquiring a lock and we also check if it's still NULL after acquiring the lock before setting it. 
+
+When we run data_race we get this warning:
+
+Write of size 8 at 0x000000611380 by thread T1 (mutexes: write M12)
+Previous read of size 8 at 0x000000611380 by thread T2
+Location is global 'pFile' of size 8 at 0x000000611380 (data_race+0x000000611380)
+
+So when T2 reads  pFile without acquiring mtx and then T1 sets the pointer after acquiring mtx the candidate set is empty for the global variable and therefore the threadsanitizer issues a warning for this DCLP code.
+
+How ThreadSanitizer catches the data race: 
+In ThreadSanitizer, each thread stores a timestamp for itself, as well as for other threads: this helps it establish synchronization. Timestamps are incremented on each memory access, and by checking these values for consistency across threads, data races are detected (irrespective of the actual access time, and even if they were not encountered in that run). Thus, ThreadSanitizer issues a warning for the erroneous DCLP code above.
